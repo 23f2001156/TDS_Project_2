@@ -21,9 +21,9 @@ import logging
 from io import BytesIO
 from typing import Dict, Any, List
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from dotenv import load_dotenv
 
 import requests
@@ -38,6 +38,20 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
+from PIL import Image
+import pytesseract
+try:
+    import cv2  # comes from opencv-python-headless
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+try:
+    import pytesseract
+    PYTESS_AVAILABLE = True
+except ImportError:
+    PYTESS_AVAILABLE = False
+
 # LangChain / LLM imports (keep as you used)
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -50,16 +64,20 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main HTML interface"""
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+
+
+
 
 # -----------------------------
 # Tools
@@ -68,81 +86,116 @@ LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
 @tool
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     """
-    Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, and plain text).
-    Always returns {"status": "success", "data": [...], "columns": [...]} if fetch works.
+    Universal web/data scraper.
+    Fetches data from any URL: JSON, CSV, Excel, Parquet, DB files, archives, HTML tables, or dynamic JS-rendered pages.
+    Returns a dictionary with status, data, and columns.
     """
-    print(f"Scraping URL: {url}")
+    import os, re, tempfile, requests, pandas as pd, duckdb
+    from io import BytesIO, StringIO
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.google.com"
+    }
+
     try:
-        from io import BytesIO, StringIO
-        from bs4 import BeautifulSoup
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.google.com/",
-        }
-
-        resp = requests.get(url, headers=headers, timeout=50)
+        resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "").lower()
 
-        df = None
+        # JSON
+        if "application/json" in ctype or url.endswith(".json"):
+            df = pd.json_normalize(resp.json())
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- CSV ---
-        if "text/csv" in ctype or url.lower().endswith(".csv"):
+        # CSV
+        if "text/csv" in ctype or url.endswith(".csv"):
             df = pd.read_csv(BytesIO(resp.content))
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- Excel ---
-        elif any(url.lower().endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
+        # Excel
+        if any(url.endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
             df = pd.read_excel(BytesIO(resp.content))
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- Parquet ---
-        elif url.lower().endswith(".parquet"):
+        # Parquet
+        if url.endswith(".parquet") or "parquet" in ctype:
             df = pd.read_parquet(BytesIO(resp.content))
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- JSON ---
-        elif "application/json" in ctype or url.lower().endswith(".json"):
-            try:
-                data = resp.json()
-                df = pd.json_normalize(data)
-            except Exception:
-                df = pd.DataFrame([{"text": resp.text}])
+        # Databases (.db, .duckdb)
+        if url.endswith(".db") or url.endswith(".duckdb"):
+            tmp_path = tempfile.NamedTemporaryFile(delete=False).name
+            with open(tmp_path, "wb") as f:
+                f.write(resp.content)
+            con = duckdb.connect(database=':memory:')
+            con.execute(f"ATTACH '{tmp_path}' AS db")
+            tables = con.execute("SHOW TABLES FROM db").fetchdf()
+            if not tables.empty:
+                table_name = tables.iloc[0, 0]
+                df = con.execute(f"SELECT * FROM db.{table_name}").fetchdf()
+                con.close()
+                os.remove(tmp_path)
+                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- HTML / Fallback ---
-        elif "text/html" in ctype or re.search(r'/wiki/|\.org|\.com', url, re.IGNORECASE):
-            html_content = resp.text
-            # Try HTML tables first
-            try:
-                tables = pd.read_html(StringIO(html_content), flavor="bs4")
-                if tables:
-                    df = tables[0]
-            except ValueError:
-                pass
+        # Archives (.tar.gz, .zip)
+        if url.endswith((".tar.gz", ".tgz", ".tar", ".zip")):
+            import tarfile, zipfile
+            content = BytesIO(resp.content)
+            if url.endswith(".zip"):
+                with zipfile.ZipFile(content, 'r') as z:
+                    for name in z.namelist():
+                        if name.endswith(".parquet"):
+                            df = pd.read_parquet(z.open(name))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+                        if name.endswith(".csv"):
+                            df = pd.read_csv(z.open(name))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+            else:
+                with tarfile.open(fileobj=content, mode="r:*") as tar:
+                    for member in tar.getmembers():
+                        if member.name.endswith(".parquet"):
+                            df = pd.read_parquet(tar.extractfile(member))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+                        if member.name.endswith(".csv"):
+                            df = pd.read_csv(tar.extractfile(member))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-            # If no table found, fallback to plain text
-            if df is None:
-                soup = BeautifulSoup(html_content, "html.parser")
-                text = soup.get_text(separator="\n", strip=True)
-                df = pd.DataFrame({"text": [text]})
+        # Static HTML tables
+        try:
+            tables = pd.read_html(StringIO(resp.text), flavor="lxml")
+            if tables:
+                df = tables[0]
+                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+        except Exception:
+            pass
 
-        # --- Unknown type fallback ---
-        else:
-            df = pd.DataFrame({"text": [resp.text]})
+        # Dynamic JS rendering
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, timeout=45000)
+                page.wait_for_load_state("networkidle")
+                html = page.content()
+                browser.close()
+            tables = pd.read_html(StringIO(html), flavor="lxml")
+            if tables:
+                df = tables[0]
+                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+        except Exception:
+            pass
 
-        # --- Normalize columns ---
-        df.columns = df.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
-
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": df.columns.tolist()
-        }
+        # Plain text fallback
+        soup = BeautifulSoup(resp.text, "lxml")
+        text = soup.get_text("\n", strip=True)
+        return {"status": "success", "data": [{"text": text}], "columns": ["text"]}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 
 # -----------------------------
@@ -275,7 +328,6 @@ def plot_to_base64(max_bytes=100000):
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
     buf.seek(0)
     img_bytes = buf.getvalue()
-    # if already under limit, return png data uri
     if len(img_bytes) <= max_bytes:
         return base64.b64encode(img_bytes).decode('ascii')
     # try decreasing dpi/figure size iteratively
@@ -308,11 +360,11 @@ def plot_to_base64(max_bytes=100000):
             return base64.b64encode(ob).decode('ascii')
     except Exception:
         pass
-    # as last resort return a downsized PNG even if > max_bytes
+    # as last resort return downsized PNG even if > max_bytes
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
     buf.seek(0)
-    return  base64.b64encode(buf.getvalue()).decode('ascii')
+    return base64.b64encode(buf.getvalue()).decode('ascii')
 '''
 
     # Build the code to write
@@ -372,22 +424,24 @@ prompt = ChatPromptTemplate.from_messages([
     ("system", """You are a full-stack autonomous data analyst agent.
 
 You will receive:
-- A set of **rules** for this request (these rules may differ depending on whether a dataset is uploaded or not)
+- A set of **rules** for this request
 - One or more **questions**
 - An optional **dataset preview**
+- A `.txt` file that specifies the required JSON keys and their types.
 
 You must:
 1. Follow the provided rules exactly.
 2. Return only a valid JSON object — no extra commentary or formatting.
 3. The JSON must contain:
-   - "questions":  keys provided in the questions file
-   - "code": "..." (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
-   - "Note" : the type of each answer should match the type it is asked in question file(e.g. int, float, str, boolean ,base64).
-4. Your Python code will run in a sandbox with:
-   - pandas, numpy, matplotlib available
-   - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
-5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
-6. Make sure all variables are defined before use, and the code can run without any undefined references.
+   - "keys": [ list of output keys exactly as specified in the .txt file ]
+   - "code": "..." (Python code that creates a dict called `results` with each output key as a key and its computed answer as the value)
+4. In your Python code, make sure the values are cast to the types specified in the .txt file:
+   - `number` → float
+   - `integer` / `int` → int
+   - `string` → str
+   - `bar_chart` / `plt` etc. → base64 PNG string under 100kB (use plot_to_base64()).
+5. Do not return the full question text as a key. Always use the JSON key specified in the `.txt`.
+6. Always define variables before use. Code must run without errors.
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -410,165 +464,280 @@ agent_executor = AgentExecutor(
 )
 
 
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
-from starlette.datastructures import UploadFile
-import os, json, tempfile
-from io import BytesIO
-import pandas as pd
-import numpy as np
+# -----------------------------
+# Runner: orchestrates agent -> pre-scrape inject -> execute
+# -----------------------------
 
-from fastapi import Request, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from io import BytesIO, StringIO
-import tempfile, json
-import pandas as pd
-
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
-from starlette.datastructures import UploadFile
-import os, json, tempfile
-from io import BytesIO
-import pandas as pd
-import numpy as np
+from fastapi import Request
 
 @app.post("/api")
 async def analyze_data(request: Request):
     try:
         form = await request.form()
+        questions_file = None
+        data_file = None
 
-        # Collect all uploaded files from the form
-        uploads = []
-        for _, value in form.multi_items():
-            if isinstance(value, UploadFile):
-                uploads.append(value)
+        for key, val in form.items():
+            if hasattr(val, "filename") and val.filename:  # it's a file
+                fname = val.filename.lower()
+                if fname.endswith(".txt") and questions_file is None:
+                    questions_file = val
+                else:
+                    data_file = val
 
-        if not uploads:
-            raise HTTPException(400, "Upload at least one file (.txt questions file is required).")
+        if not questions_file:
+            raise HTTPException(400, "Missing questions file (.txt)")
 
-        # Find exactly one .txt as questions file
-        txt_files = [f for f in uploads if (f.filename or "").lower().endswith(".txt")]
-        if len(txt_files) != 1:
-            raise HTTPException(400, "Exactly one .txt questions file is required.")
-        questions_file = txt_files[0]
         raw_questions = (await questions_file.read()).decode("utf-8")
-
-
-        type_map = {}
-        patterns = [
-            re.compile(r"^\s*-\s*`([^`]+)`\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list with backticks
-            re.compile(r"^\s*-\s*([a-zA-Z0-9_]+)\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list no backticks
-            re.compile(r"`([^`]+)`\s*\((number|string|boolean|base64)[s]?\)", re.IGNORECASE),  # inline (type)
-        ]
-
-        for pat in patterns:
-            for match in pat.finditer(raw_questions):
-                key, type_hint = match.groups()
-                norm_type = type_hint.strip().lower()
-                if norm_type in ("number", "float", "int"):
-                    norm_type = "number"
-                elif norm_type in ("string", "str"):
-                    norm_type = "string"
-                elif "base64" in norm_type:
-                    norm_type = "base64"
-                elif norm_type in ("bool", "boolean"):
-                    norm_type = "boolean"
-                type_map[key.strip()] = norm_type
-
-        # Build type note for LLM prompt
-        type_note = "\nNote: The following are the exact expected types for each key based on the questions file:\n"
-        if type_map:
-            for k, t in type_map.items():
-                type_note += f"- {k}: {t}\n"
-        else:
-            type_note += "(No explicit types detected in questions file)\n"
-
-        # All others are candidate datasets
-        data_candidates = [f for f in uploads if f is not questions_file]
-
+        
         pickle_path = None
         df_preview = ""
         dataset_uploaded = False
 
-        # Try to parse the first valid dataset
-        for data_file in data_candidates:
-            filename = (data_file.filename or "").lower()
-            content = await data_file.read()
-
-            try:
-                if filename.endswith(".csv"):
-                    df = pd.read_csv(BytesIO(content))
-                elif filename.endswith((".xlsx", ".xls")):
-                    df = pd.read_excel(BytesIO(content))
-                elif filename.endswith(".parquet"):
-                    df = pd.read_parquet(BytesIO(content))
-                elif filename.endswith(".json"):
-                    try:
-                        df = pd.read_json(BytesIO(content))
-                    except ValueError:
-                        df = pd.DataFrame(json.loads(content.decode("utf-8")))
-                elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
-                    try:
-                        if PIL_AVAILABLE:
-                            image = Image.open(BytesIO(content))
-                            image = image.convert("RGB")  # ensure RGB format
-                            df = pd.DataFrame({"image": [image]})  # store as a single column DataFrame
-                        else:
-                            raise ValueError("PIL is not available for image processing.")
-                    except Exception as e:
-                        raise ValueError(f"Failed to process image file: {str(e)}")
-                else:
-                    continue  # unsupported type
-            except Exception:
-                continue  # failed parse
-
-            # If parsed successfully
+        if data_file:
             dataset_uploaded = True
+            filename = data_file.filename.lower()
+            content = await data_file.read()
+            from io import BytesIO
+            import duckdb, tempfile, tarfile, zipfile
+
+            df = None
+            duckdb_conn = duckdb.connect(database=':memory:')
+
+            # CSV
+            if filename.endswith(".csv"):
+                df = pd.read_csv(BytesIO(content))
+                duckdb_conn.register("df", df)
+
+            # Excel
+            elif filename.endswith((".xlsx", ".xls")):
+                df = pd.read_excel(BytesIO(content))
+                duckdb_conn.register("df", df)
+            
+            elif filename.lower().endswith(".pdf"):
+                api_key = os.getenv("GOOGLE_API_KEY")
+                if not api_key:
+                    raise HTTPException(500, "GOOGLE_API_KEY not set")
+                genai.configure(api_key=api_key)
+
+                # Send PDF bytes directly to Gemini
+                parts = [
+                    {
+                        "mime_type": "application/pdf",
+                        "data": content,  # raw PDF bytes
+                    },
+                    {
+                        "text": (
+                            "Extract ALL tabular data from the PDF as JSON only, format:\n"
+                            '{"columns":["col1",...],"rows":[["r1c1",...],["r2c1",...]]}\n'
+                            "If multiple tables, merge into one if columns match. "
+                            "Keep numbers numeric; no commentary."
+                        )
+                    }
+                ]
+
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                resp = model.generate_content(parts)
+                raw = (resp.text or "").strip()
+
+                # Extract JSON
+                m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+                payload = m.group(0) if m else ""
+
+                try:
+                    obj = json.loads(payload)
+                    cols = obj.get("columns", [])
+                    rows = obj.get("rows", [])
+                    df = pd.DataFrame(rows, columns=cols if cols else None)
+                    df = df.apply(pd.to_numeric, errors="ignore")
+                    duckdb_conn.register("df", df)
+                except Exception:
+                    # Fallback: just get text
+                    resp2 = model.generate_content([parts[0], {"text": "Extract all visible text. Return plain text only."}])
+                    pdf_text = (resp2.text or "").strip()
+                    df = pd.DataFrame({"ocr_text": [pdf_text]})
+                    duckdb_conn.register("df", df)
+
+            # Parquet
+            elif filename.endswith(".parquet"):
+                df = pd.read_parquet(BytesIO(content))
+                duckdb_conn.register("df", df)
+
+            # SQLite / DuckDB database
+            elif filename.endswith(".db") or filename.endswith(".duckdb"):
+                tmp_path = tempfile.NamedTemporaryFile(delete=False).name
+                with open(tmp_path, "wb") as f:
+                    f.write(content)
+                duckdb_conn.execute(f"ATTACH '{tmp_path}' AS uploaded_db")
+                # Pick the first table for df
+                tables = duckdb_conn.execute("SHOW TABLES FROM uploaded_db").fetchdf()
+                if not tables.empty:
+                    first_table = tables.iloc[0, 0]
+                    df = duckdb_conn.execute(f"SELECT * FROM uploaded_db.{first_table}").fetchdf()
+
+            # Archives (.tar.gz, .zip)
+            elif filename.endswith((".tar.gz", ".tgz", ".tar", ".zip")):
+                content_io = BytesIO(content)
+                if filename.endswith(".zip"):
+                    with zipfile.ZipFile(content_io, 'r') as z:
+                        for name in z.namelist():
+                            if name.endswith(".parquet"):
+                                df = pd.read_parquet(z.open(name))
+                                break
+                            if name.endswith(".csv"):
+                                df = pd.read_csv(z.open(name))
+                                break
+                else:
+                    with tarfile.open(fileobj=content_io, mode="r:*") as tar:
+                        for member in tar.getmembers():
+                            if member.name.endswith(".parquet"):
+                                df = pd.read_parquet(tar.extractfile(member))
+                                break
+                            if member.name.endswith(".csv"):
+                                df = pd.read_csv(tar.extractfile(member))
+                                break
+                if df is not None:
+                    duckdb_conn.register("df", df)
+
+            # JSON
+            elif filename.endswith(".json"):
+                try:
+                    df = pd.read_json(BytesIO(content))
+                except ValueError:
+                    df = pd.DataFrame(json.loads(content.decode("utf-8")))
+                duckdb_conn.register("df", df)
+
+            elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                import io, os, json, re
+                import google.generativeai as genai
+
+                # 1) Configure Gemini
+                api_key = os.getenv("GOOGLE_API_KEY")
+                if not api_key:
+                    raise HTTPException(500, "GOOGLE_API_KEY not set")
+                genai.configure(api_key=api_key)
+
+                # 2) Read image bytes
+                image_bytes = content  # already read earlier
+                # Build the multimodal input
+                parts = [
+                    {
+                        "mime_type": (
+                            "image/png" if filename.lower().endswith(".png")
+                            else "image/jpeg"
+                        ),
+                        "data": image_bytes,
+                    },
+                    {
+                        "text": (
+                            "You are a table extractor. "
+                            "From the provided image, extract ALL tabular data into a single JSON object "
+                            "with the following shape ONLY:\n\n"
+                            "{\n"
+                            '  "columns": ["col1","col2",...],\n'
+                            '  "rows": [ ["r1c1","r1c2",...], ["r2c1","r2c2",...], ... ]\n'
+                            "}\n\n"
+                            "Rules:\n"
+                            "- Infer column names from the image header if present; otherwise use generic names like Col1, Col2, ...\n"
+                            "- Keep numbers as numbers (no commas), text as strings.\n"
+                            "- Do not add commentary. Return ONLY valid minified JSON."
+                        )
+                    }
+                ]
+
+                # 3) Call Gemini (no Tesseract needed)
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                try:
+                    resp = model.generate_content(parts)
+                    raw = resp.text or ""
+                except Exception as e:
+                    raise HTTPException(500, f"Gemini error: {e}")
+
+                # 4) Extract strict JSON
+                #    (Sometimes models add accidental text; strip it and keep only the first JSON object.)
+                def extract_json(s: str):
+                    # find first {...} block
+                    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+                    return m.group(0) if m else ""
+
+                payload = extract_json(raw)
+
+                # 5) Build DataFrame from JSON or fall back to raw text
+                try:
+                    obj = json.loads(payload)
+                    cols = obj.get("columns", [])
+                    rows = obj.get("rows", [])
+
+                    if rows and isinstance(rows[0], dict):
+                        df = pd.DataFrame(rows)
+                        # ensure column order
+                        if cols:
+                            df = df[[c for c in cols if c in df.columns]]
+                    else:
+                        df = pd.DataFrame(rows, columns=cols if cols else None)
+
+                    # Optional: coerce numeric-looking strings to numbers
+                    df = df.apply(pd.to_numeric, errors="ignore")
+
+                    duckdb_conn.register("df", df)
+
+                except Exception:
+                    # Fallback: ask Gemini for plain text and pass it to the model
+                    # (works with your existing questions if they parse text first)
+                    try:
+                        model_text = genai.GenerativeModel("gemini-1.5-flash")
+                        resp2 = model_text.generate_content([
+                            parts[0],
+                            {"text": "Extract all text content from the image. Return plain text only."}
+                        ])
+                        ocr_text = (resp2.text or "").strip()
+                    except Exception:
+                        ocr_text = ""
+
+                    df = pd.DataFrame({"ocr_text": [ocr_text]})
+                    duckdb_conn.register("df", df)
+
+
+            else:
+                raise HTTPException(400, f"Unsupported data file type: {filename}")
+
+            # Save pickle for LLM code injection
             temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             temp_pkl.close()
             df.to_pickle(temp_pkl.name)
             pickle_path = temp_pkl.name
 
+            # Inject duckdb_conn into execution environment
             df_preview = (
                 f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
                 f"Columns: {', '.join(df.columns.astype(str))}\n"
                 f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
+                f"You can also query the dataset using DuckDB via the variable `duckdb_conn`.\n"
             )
-            break  # only the first valid dataset is used
 
-        # Build LLM rules
+        # Build rules based on data presence
         if dataset_uploaded:
             llm_rules = (
                 "Rules:\n"
                 "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
                 "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
-                "3) Use only the uploaded dataset for answering questions.\n"
-                "4) Produce a final JSON object with keys:\n"
-                '   - "questions": exact keys provided in questions txt file \n'
-                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
-                "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
         else:
             llm_rules = (
                 "Rules:\n"
                 "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
-                "2) Produce a final JSON object with keys:\n"
-                '   - "questions": exact keys provided in questions txt file \n'
-                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
-                "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
 
         llm_input = (
             f"{llm_rules}\nQuestions:\n{raw_questions}\n"
-            f"{df_preview if df_preview else ''}\n"
-            f"{type_note}\n"
+            f"{df_preview if df_preview else ''}"
             "Respond with the JSON object only."
         )
 
-        # Run unified agent
+        # Run agent
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as ex:
-            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, type_map)
+            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
             try:
                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
@@ -576,7 +745,7 @@ async def analyze_data(request: Request):
 
         if "error" in result:
             raise HTTPException(500, detail=result["error"])
-
+        print(result)
         return JSONResponse(content=result)
 
     except HTTPException as he:
@@ -586,33 +755,34 @@ async def analyze_data(request: Request):
         raise HTTPException(500, detail=str(e))
 
 
-# -----------------------------
-# Runner: orchestrates agent -> pre-scrape inject -> execute
-# -----------------------------
-    
-def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: dict = None) -> Dict:
+def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     """
     Runs the LLM agent and executes code.
+    - Retries up to 3 times if agent returns no output.
     - If pickle_path is provided, injects that DataFrame directly.
     - If no pickle_path, falls back to scraping when needed.
     """
     try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+        max_retries = 5
+        raw_out = ""
+        for attempt in range(1, max_retries + 1):
+            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+            if raw_out:
+                break
         if not raw_out:
-            return {"error": "Agent returned no output"}
+            return {"error": f"Agent returned no output after {max_retries} attempts"}
 
         parsed = clean_llm_output(raw_out)
         if "error" in parsed:
             return parsed
 
-        if "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response: {parsed}"}
+        if not isinstance(parsed, dict) or "code" not in parsed or ("questions" not in parsed and "keys" not in parsed):
+            return {"error": f"Invalid agent response format: {parsed}"}
+
+
 
         code = parsed["code"]
-        questions = parsed["questions"]
-
-        # If no pickle provided, check if code tries to scrape
         if pickle_path is None:
             urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
             if urls:
@@ -626,33 +796,18 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: 
                 df.to_pickle(temp_pkl.name)
                 pickle_path = temp_pkl.name
 
-        # Execute code with pickle injection if available
         exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
         if exec_result.get("status") != "success":
             return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
 
         results_dict = exec_result.get("result", {})
-        print(f"Results dict: {results_dict}")
-        if type_map:
-            for k, expected in type_map.items():
-                if k not in results_dict:
-                    continue
-                v = results_dict[k]
-                if expected == "number":
-                    try:
-                        num = float(v)
-                        results_dict[k] = int(num) if num.is_integer() else num
-                    except:
-                        results_dict[k] = None
-                elif expected in ("string", "base64"):
-                    results_dict[k] = "" if v is None else str(v)
-                elif expected == "boolean":
-                    results_dict[k] = bool(v)  
         return results_dict
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
+
+
     
 from fastapi.responses import FileResponse, Response
 import base64, os
